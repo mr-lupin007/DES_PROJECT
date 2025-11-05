@@ -32,6 +32,8 @@ if 'video_frames' not in st.session_state:
     st.session_state.video_frames = []
 if 'emotion_data' not in st.session_state:
     st.session_state.emotion_data = []
+if 'mic_checked' not in st.session_state:
+    st.session_state.mic_checked = False
 
 # Database setup
 def init_db():
@@ -52,6 +54,24 @@ def init_db():
     conn.close()
 
 init_db()
+
+# Microphone testing function
+def test_microphone():
+    """Test if microphone is working"""
+    recognizer = sr.Recognizer()
+    try:
+        # List all microphones
+        mic_list = sr.Microphone.list_microphone_names()
+        
+        if not mic_list:
+            return False, "No microphones found", []
+        
+        # Try to access default microphone
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            return True, f"Microphone working! Found {len(mic_list)} device(s)", mic_list
+    except Exception as e:
+        return False, f"Microphone error: {str(e)}", []
 
 # Helper Functions
 def save_session(data):
@@ -151,34 +171,60 @@ def simple_emotion_detection(frame):
     except:
         return 'neutral'
 
-def record_audio(duration, result_queue):
-    """Record audio and convert to text"""
+def record_audio_continuous(duration, result_queue, mic_index=None):
+    """Record audio continuously and convert to text"""
     recognizer = sr.Recognizer()
     recognizer.dynamic_energy_threshold = True
-    recognizer.energy_threshold = 4000
+    recognizer.energy_threshold = 300  # Lower threshold for better detection
     
     full_text = ""
     
     try:
-        with sr.Microphone() as source:
+        # Use specific microphone or default
+        if mic_index is not None:
+            mic = sr.Microphone(device_index=mic_index)
+        else:
+            mic = sr.Microphone()
+        
+        with mic as source:
             # Adjust for ambient noise
             recognizer.adjust_for_ambient_noise(source, duration=1)
             
-            chunks = max(1, duration // 5)  # Record in 5-second chunks
+            start_time = time.time()
             
-            for i in range(chunks):
+            # Record in chunks
+            while time.time() - start_time < duration:
                 try:
-                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
-                    text = recognizer.recognize_google(audio)
-                    full_text += " " + text
+                    remaining = duration - (time.time() - start_time)
+                    if remaining <= 0:
+                        break
+                    
+                    chunk_duration = min(4, remaining)
+                    audio = recognizer.listen(source, timeout=chunk_duration, phrase_time_limit=chunk_duration)
+                    
+                    try:
+                        text = recognizer.recognize_google(audio)
+                        if text:
+                            full_text += " " + text
+                            print(f"Recognized: {text}")  # Debug output
+                    except sr.UnknownValueError:
+                        print("Could not understand audio")
+                        continue
+                    except sr.RequestError as e:
+                        print(f"API error: {e}")
+                        continue
+                        
                 except sr.WaitTimeoutError:
+                    print("Listening timeout, continuing...")
                     continue
-                except sr.UnknownValueError:
+                except Exception as e:
+                    print(f"Chunk error: {e}")
                     continue
-                except:
-                    continue
+                    
     except Exception as e:
         print(f"Audio recording error: {e}")
+        result_queue.put(f"ERROR: {str(e)}")
+        return
     
     result_queue.put(full_text.strip())
 
@@ -314,9 +360,105 @@ st.markdown("### Practice your presentations with real-time analysis")
 # Sidebar
 with st.sidebar:
     st.header("📊 Dashboard")
-    page = st.radio("Navigation", ["Live Practice", "History & Progress", "About"])
+    page = st.radio("Navigation", ["Live Practice", "Microphone Test", "History & Progress", "About"])
 
-if page == "Live Practice":
+if page == "Microphone Test":
+    st.header("🎤 Microphone Diagnostics")
+    
+    st.markdown("""
+    ### Test your microphone before recording
+    This will help identify and fix any audio issues.
+    """)
+    
+    if st.button("🔍 Test Microphone", type="primary"):
+        with st.spinner("Testing microphone..."):
+            success, message, mic_list = test_microphone()
+            
+            if success:
+                st.success(f"✅ {message}")
+                
+                st.subheader("Available Microphones:")
+                for i, mic_name in enumerate(mic_list):
+                    st.write(f"{i}. {mic_name}")
+                
+                st.info("💡 Your default microphone is working! You can now use Live Practice.")
+                
+            else:
+                st.error(f"❌ {message}")
+                
+                st.markdown("""
+                ### Troubleshooting Steps:
+                
+                #### Windows:
+                1. **Check Privacy Settings:**
+                   - Go to Settings > Privacy > Microphone
+                   - Enable "Allow apps to access your microphone"
+                   - Scroll down and enable for Python/VS Code
+                
+                2. **Check Device Manager:**
+                   - Right-click Start > Device Manager
+                   - Expand "Audio inputs and outputs"
+                   - Make sure microphone is enabled
+                
+                3. **Test in Sound Settings:**
+                   - Right-click speaker icon > Sounds
+                   - Go to Recording tab
+                   - Speak and check if the bar moves
+                
+                #### Mac:
+                1. **Check System Preferences:**
+                   - Go to System Preferences > Security & Privacy
+                   - Click Microphone tab
+                   - Enable Terminal/VS Code/iTerm
+                
+                2. **Test microphone:**
+                   - Open QuickTime Player
+                   - File > New Audio Recording
+                   - Check if it detects sound
+                
+                #### Linux:
+                ```bash
+                # Check microphone
+                arecord -l
+                
+                # Test recording
+                arecord -d 5 test.wav
+                aplay test.wav
+                ```
+                
+                #### Common Issues:
+                - **No microphone found**: Check if microphone is plugged in
+                - **Permission denied**: Grant microphone permissions to Terminal/Python
+                - **Device in use**: Close other applications using microphone
+                - **Wrong default device**: Set correct default in system settings
+                """)
+    
+    st.markdown("---")
+    st.subheader("🎙️ Quick Microphone Test")
+    
+    recognizer = sr.Recognizer()
+    
+    if st.button("🔴 Record 3 Seconds"):
+        try:
+            with sr.Microphone() as source:
+                st.info("🎤 Listening... Speak now!")
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
+                
+                st.success("✅ Audio captured! Processing...")
+                
+                try:
+                    text = recognizer.recognize_google(audio)
+                    st.success(f"**Recognized:** {text}")
+                except sr.UnknownValueError:
+                    st.warning("⚠️ Could not understand audio. Speak louder and clearer.")
+                except sr.RequestError:
+                    st.error("❌ Could not request results. Check internet connection.")
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            st.info("Make sure microphone permissions are granted!")
+
+elif page == "Live Practice":
     st.header("🎥 Live Recording Session")
     
     col1, col2 = st.columns([2, 1])
@@ -347,23 +489,47 @@ if page == "Live Practice":
         
         duration = duration_options[selected_duration]
         
+        # Microphone selection (optional)
+        try:
+            mic_list = sr.Microphone.list_microphone_names()
+            if len(mic_list) > 1:
+                mic_choice = st.selectbox(
+                    "Select Microphone (optional):",
+                    options=["Default"] + [f"{i}: {name}" for i, name in enumerate(mic_list)]
+                )
+                if mic_choice != "Default":
+                    selected_mic_index = int(mic_choice.split(":")[0])
+                else:
+                    selected_mic_index = None
+            else:
+                selected_mic_index = None
+        except:
+            selected_mic_index = None
+        
         # Start recording button
         if not st.session_state.recording:
             if st.button("🔴 Start Live Recording", type="primary", use_container_width=True):
-                st.session_state.recording = True
-                st.session_state.recorded_text = ""
-                st.session_state.video_frames = []
-                st.session_state.emotion_data = []
-                st.rerun()
+                # Test microphone first
+                success, _, _ = test_microphone()
+                if not success:
+                    st.error("❌ Microphone not detected! Please check 'Microphone Test' page.")
+                else:
+                    st.session_state.recording = True
+                    st.session_state.recorded_text = ""
+                    st.session_state.video_frames = []
+                    st.session_state.emotion_data = []
+                    st.rerun()
         
         # Recording in progress
         if st.session_state.recording:
             st.warning(f"🔴 **RECORDING IN PROGRESS** - {selected_duration}")
+            st.info("💡 **Speak clearly and naturally. Look at the camera!**")
             
             # Placeholders
             video_placeholder = st.empty()
             progress_bar = st.progress(0)
             status_text = st.empty()
+            audio_status = st.empty()
             
             # Initialize camera
             cap = cv2.VideoCapture(0)
@@ -375,8 +541,12 @@ if page == "Live Practice":
             
             # Start audio recording in separate thread
             audio_queue = queue.Queue()
-            audio_thread = threading.Thread(target=record_audio, args=(duration, audio_queue))
+            audio_thread = threading.Thread(
+                target=record_audio_continuous, 
+                args=(duration, audio_queue, selected_mic_index if 'selected_mic_index' in locals() else None)
+            )
             audio_thread.start()
+            audio_status.info("🎤 Audio recording started...")
             
             # Record video
             start_time = time.time()
@@ -404,9 +574,9 @@ if page == "Live Practice":
                         eye_contact_frames += 1
                     emotion_list.append(emotion)
                 
-                # Draw rectangle around face area
+                # Draw info on frame
                 if face_detected:
-                    cv2.putText(frame, f"Face Detected - {emotion.title()}", 
+                    cv2.putText(frame, f"Face: {emotion.title()}", 
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     if eye_contact:
                         cv2.putText(frame, "Good Eye Contact!", 
@@ -431,13 +601,17 @@ if page == "Live Practice":
             # Stop recording
             cap.release()
             st.session_state.recording = False
+            audio_status.info("⏳ Processing audio... Please wait...")
             
             # Wait for audio thread
-            audio_thread.join(timeout=2)
+            audio_thread.join(timeout=10)
             
             # Get transcribed text
             try:
                 transcribed_text = audio_queue.get_nowait()
+                if transcribed_text.startswith("ERROR:"):
+                    st.error(transcribed_text)
+                    transcribed_text = ""
             except:
                 transcribed_text = ""
             
@@ -497,9 +671,9 @@ if page == "Live Practice":
         **For Best Results:**
         - Good lighting on face
         - Look at camera often
-        - Speak clearly
+        - Speak clearly & loudly
         - Minimize background noise
-        - Maintain good posture
+        - Check microphone first
         """)
         
         st.subheader("🎯 Goals")
@@ -509,6 +683,14 @@ if page == "Live Practice":
         - **Fillers**: <5
         - **Expression**: Positive
         """)
+        
+        # Microphone status
+        if st.button("🔍 Check Mic"):
+            success, msg, _ = test_microphone()
+            if success:
+                st.success("✅ Mic OK")
+            else:
+                st.error("❌ Mic Issue")
     
     # Display results
     if st.session_state.analysis_complete and st.session_state.session_data:
@@ -541,11 +723,18 @@ if page == "Live Practice":
         st.markdown("---")
         
         # Transcript
-        if metrics.get('transcript'):
-            with st.expander("📝 View Transcript", expanded=False):
+        if metrics.get('transcript') and len(metrics['transcript']) > 0:
+            with st.expander("📝 View Transcript", expanded=True):
                 st.write(metrics['transcript'])
         else:
-            st.info("ℹ️ No speech detected. Make sure your microphone is working and unmuted.")
+            st.warning("⚠️ **No speech detected!** Check:")
+            st.markdown("""
+            - Microphone is unmuted
+            - Microphone permissions granted
+            - Speaking loud enough
+            - Internet connection active
+            - Try 'Microphone Test' page
+            """)
         
         # Detailed metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -712,6 +901,7 @@ else:  # About page
     
     - **Live Video Recording**: Records from webcam with real-time face detection
     - **Speech Recognition**: Converts speech to text using Google Speech API
+    - **Microphone Diagnostics**: Built-in testing to troubleshoot audio issues
     - **Speech Analysis**: Detects pacing (WPM), filler words, and pauses
     - **Emotion Recognition**: Analyzes facial expressions during presentations
     - **Eye Contact Tracking**: Estimates gaze direction and engagement
@@ -751,16 +941,17 @@ else:  # About page
     
     ### 📖 How to Use
     
-    1. **Select Duration**: Choose recording length (30s to 5min)
-    2. **Start Recording**: Click the button and begin presenting
-    3. **Speak Naturally**: Look at camera and deliver your content
-    4. **Get Feedback**: Receive detailed analysis with improvement tips
-    5. **Track Progress**: Review history to see your improvement
+    1. **Test Microphone**: Visit 'Microphone Test' page to ensure audio is working
+    2. **Select Duration**: Choose recording length (30s to 5min)
+    3. **Start Recording**: Click the button and begin presenting
+    4. **Speak Naturally**: Look at camera and deliver your content clearly
+    5. **Get Feedback**: Receive detailed analysis with improvement tips
+    6. **Track Progress**: Review history to see your improvement
     
     ### 💻 System Requirements
     
     - **Webcam**: Required for video recording
-    - **Microphone**: Required for speech recognition
+    - **Microphone**: Required for speech recognition (with proper permissions)
     - **Internet**: Required for Google Speech API
     - **Python**: 3.8+ with required libraries
     
@@ -776,21 +967,30 @@ else:  # About page
     streamlit run app.py
     ```
     
-    ### 🔧 Troubleshooting
+    ### 🔧 Troubleshooting Microphone Issues
     
-    **No speech detected:**
-    - Check microphone permissions
-    - Ensure microphone is unmuted
-    - Speak clearly and at normal volume
+    **Windows:**
+    - Settings > Privacy > Microphone > Allow apps to access microphone
+    - Enable for Python/Terminal
     
-    **Camera not working:**
-    - Check webcam permissions
-    - Close other apps using camera
-    - Try restarting the application
+    **Mac:**
+    - System Preferences > Security & Privacy > Microphone
+    - Enable Terminal/VS Code/iTerm
     
-    **Import errors:**
-    - Install all required packages
-    - For PyAudio issues on Windows: `pip install pipwin && pipwin install pyaudio`
+    **Linux:**
+    ```bash
+    # Check microphone
+    arecord -l
+    # Test recording
+    arecord -d 5 test.wav && aplay test.wav
+    ```
+    
+    **Common Fixes:**
+    - Unmute microphone in system settings
+    - Close other apps using microphone (Zoom, Skype, Discord)
+    - Select correct microphone in app settings
+    - Grant permissions to Terminal/Python
+    - Restart Terminal/VS Code after granting permissions
     
     ### 🔮 Future Enhancements
     
@@ -837,7 +1037,7 @@ else:  # About page
     
     ---
     
-    **Version 2.0 - Live Recording with Real-time Analysis**
+    **Version 2.1 - Enhanced Microphone Detection & Diagnostics**
     
     *Built with ❤️ for better public speaking*
     """)
@@ -845,6 +1045,6 @@ else:  # About page
 # Footer
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>DES646 Project - AI Presentation Coach © 2025 | Live Recording Enabled</div>",
+    "<div style='text-align: center; color: gray;'>DES646 Project - AI Presentation Coach © 2025 | Live Recording with Audio Diagnostics</div>",
     unsafe_allow_html=True
 )
