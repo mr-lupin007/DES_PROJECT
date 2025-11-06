@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime
 import sqlite3
 import json
@@ -11,13 +12,105 @@ from collections import Counter
 import speech_recognition as sr
 import threading
 import queue
+import requests
+from PIL import Image
+import io
+import sys
+
+# Force UTF-8 encoding
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# Set style
+sns.set_style("whitegrid")
+plt.style.use('seaborn-v0_8-darkgrid')
 
 # Configure page
 st.set_page_config(
-    page_title="AI Presentation Coach",
-    page_icon="🎤",
-    layout="wide"
+    page_title="AI Presentation Coach Pro",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# IMPROVED CSS - Fixed text visibility with explicit colors
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        background: linear-gradient(120deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        padding: 1rem 0;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 15px;
+        color: white !important;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .metric-card h3, .metric-card p, .metric-card li, .metric-card strong {
+        color: white !important;
+    }
+    .stButton>button {
+        width: 100%;
+        border-radius: 10px;
+        height: 3rem;
+        font-weight: bold;
+        font-size: 1.1rem;
+    }
+    .score-excellent {
+        color: #2ecc71;
+        font-size: 4rem;
+        font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+    }
+    .score-good {
+        color: #f39c12;
+        font-size: 4rem;
+        font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+    }
+    .score-poor {
+        color: #e74c3c;
+        font-size: 4rem;
+        font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+    }
+    .feedback-box {
+        background: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 5px solid #667eea;
+        margin: 1rem 0;
+        color: #2c3e50 !important;
+    }
+    .feedback-box p, .feedback-box li, .feedback-box strong, .feedback-box h3, .feedback-box ul {
+        color: #2c3e50 !important;
+    }
+    .ai-insight {
+        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+        padding: 1.5rem;
+        border-radius: 15px;
+        border: 2px solid #667eea;
+        margin: 1rem 0;
+        color: #2c3e50 !important;
+    }
+    .ai-insight p, .ai-insight h3, .ai-insight li, .ai-insight strong, .ai-insight h4 {
+        color: #2c3e50 !important;
+    }
+    /* Global text visibility fix */
+    .stMarkdown, .stMarkdown p, .stMarkdown h3, .stMarkdown li, .stMarkdown strong {
+        color: #2c3e50 !important;
+    }
+    div[data-testid="stVerticalBlock"] > div {
+        color: #2c3e50 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Initialize session state
 if 'recording' not in st.session_state:
@@ -26,19 +119,39 @@ if 'analysis_complete' not in st.session_state:
     st.session_state.analysis_complete = False
 if 'session_data' not in st.session_state:
     st.session_state.session_data = None
-if 'recorded_text' not in st.session_state:
-    st.session_state.recorded_text = ""
-if 'video_frames' not in st.session_state:
-    st.session_state.video_frames = []
-if 'emotion_data' not in st.session_state:
-    st.session_state.emotion_data = []
-if 'mic_checked' not in st.session_state:
-    st.session_state.mic_checked = False
+if 'gemini_api_key' not in st.session_state:
+    st.session_state.gemini_api_key = ""
+if 'face_cascade' not in st.session_state:
+    st.session_state.face_cascade = None
+if 'eye_cascade' not in st.session_state:
+    st.session_state.eye_cascade = None
+
+# IMPROVED: Load cascades with error handling
+def load_cascades():
+    """Load Haar Cascades with fallback options"""
+    try:
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        
+        # Verify cascades loaded correctly
+        if face_cascade.empty() or eye_cascade.empty():
+            st.error("⚠️ Error loading face detection models. Please reinstall OpenCV.")
+            return None, None
+            
+        return face_cascade, eye_cascade
+    except Exception as e:
+        st.error(f"❌ Cascade loading error: {str(e)}")
+        return None, None
+
+# Load cascades on startup
+if st.session_state.face_cascade is None:
+    st.session_state.face_cascade, st.session_state.eye_cascade = load_cascades()
 
 # Database setup
 def init_db():
     conn = sqlite3.connect('presentation_history.db')
     c = conn.cursor()
+    
     c.execute('''CREATE TABLE IF NOT EXISTS sessions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   date TEXT,
@@ -49,29 +162,157 @@ def init_db():
                   emotion_scores TEXT,
                   pause_count INTEGER,
                   overall_score REAL,
-                  transcript TEXT)''')
+                  transcript TEXT,
+                  ai_feedback TEXT,
+                  confidence_score REAL,
+                  clarity_score REAL,
+                  engagement_score REAL)''')
+    
+    cursor = c.execute('PRAGMA table_info(sessions)')
+    columns = [column[1] for column in cursor.fetchall()]
+    
+    if 'ai_feedback' not in columns:
+        c.execute('ALTER TABLE sessions ADD COLUMN ai_feedback TEXT')
+    if 'confidence_score' not in columns:
+        c.execute('ALTER TABLE sessions ADD COLUMN confidence_score REAL')
+    if 'clarity_score' not in columns:
+        c.execute('ALTER TABLE sessions ADD COLUMN clarity_score REAL')
+    if 'engagement_score' not in columns:
+        c.execute('ALTER TABLE sessions ADD COLUMN engagement_score REAL')
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-# Microphone testing function
-def test_microphone():
-    """Test if microphone is working"""
-    recognizer = sr.Recognizer()
+# Gemini AI Integration
+def get_gemini_feedback(transcript, metrics):
+    """Get AI-powered feedback using Gemini API"""
+    if not st.session_state.gemini_api_key:
+        return generate_rule_based_feedback(metrics)
+    
     try:
-        # List all microphones
-        mic_list = sr.Microphone.list_microphone_names()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={st.session_state.gemini_api_key}"
         
-        if not mic_list:
-            return False, "No microphones found", []
+        prompt = f"""As an expert public speaking coach, analyze this presentation:
+
+TRANSCRIPT: "{transcript}"
+
+METRICS:
+- Words per minute: {metrics['wpm']:.0f}
+- Filler words count: {metrics['filler_count']}
+- Eye contact score: {metrics['eye_contact_score']:.0f}%
+- Duration: {metrics['duration']} seconds
+- Word count: {metrics['word_count']}
+
+Provide a detailed, professional analysis covering:
+1. Content Quality & Structure (2-3 sentences)
+2. Delivery & Pace Assessment (2-3 sentences)
+3. Body Language & Engagement (2-3 sentences)
+4. Top 3 Specific Improvement Actions
+5. Top 3 Strengths to Maintain
+
+Be encouraging but honest. Format with clear sections."""
+
+        headers = {'Content-Type': 'application/json'}
+        data = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
+        }
         
-        # Try to access default microphone
-        with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            return True, f"Microphone working! Found {len(mic_list)} device(s)", mic_list
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return generate_rule_based_feedback(metrics)
+            
     except Exception as e:
-        return False, f"Microphone error: {str(e)}", []
+        print(f"Gemini API error: {e}")
+        return generate_rule_based_feedback(metrics)
+
+def generate_rule_based_feedback(metrics):
+    """Generate detailed rule-based feedback"""
+    feedback = "### 📊 Professional Analysis\n\n"
+    
+    # Content Quality
+    feedback += "**🎯 Content & Structure:**\n"
+    if metrics['word_count'] > 100:
+        feedback += "Your presentation demonstrated substantial content depth. "
+    elif metrics['word_count'] > 50:
+        feedback += "Your presentation covered key points adequately. "
+    else:
+        feedback += "Consider expanding your content for more comprehensive coverage. "
+    
+    if metrics['filler_count'] < 3:
+        feedback += "The message was delivered with clarity and precision.\n\n"
+    elif metrics['filler_count'] < 8:
+        feedback += "The message was generally clear with room for refinement.\n\n"
+    else:
+        feedback += "Focus on eliminating verbal fillers to enhance message clarity.\n\n"
+    
+    # Delivery
+    feedback += "**🎤 Delivery & Pace:**\n"
+    if 120 <= metrics['wpm'] <= 180:
+        feedback += f"Excellent pacing at {metrics['wpm']:.0f} WPM - within the optimal range for audience comprehension. "
+    elif metrics['wpm'] < 120:
+        feedback += f"Your pace of {metrics['wpm']:.0f} WPM is slower than optimal. Consider increasing energy and tempo. "
+    else:
+        feedback += f"Your pace of {metrics['wpm']:.0f} WPM is quite fast. Slow down to ensure clarity and audience retention. "
+    
+    feedback += "Professional speakers aim for 120-180 words per minute.\n\n"
+    
+    # Engagement
+    feedback += "**👁️ Body Language & Engagement:**\n"
+    if metrics['eye_contact_score'] > 75:
+        feedback += f"Outstanding eye contact at {metrics['eye_contact_score']:.0f}%. You maintained strong visual connection with your audience. "
+    elif metrics['eye_contact_score'] > 60:
+        feedback += f"Good eye contact at {metrics['eye_contact_score']:.0f}%. Work on maintaining this throughout. "
+    else:
+        feedback += f"Eye contact at {metrics['eye_contact_score']:.0f}% needs improvement. This is crucial for audience engagement. "
+    
+    feedback += "Strong eye contact builds trust and credibility.\n\n"
+    
+    # Strengths
+    feedback += "**✅ Key Strengths:**\n"
+    strengths = []
+    if metrics['wpm'] >= 120 and metrics['wpm'] <= 180:
+        strengths.append("Optimal speaking pace")
+    if metrics['filler_count'] < 5:
+        strengths.append("Minimal use of filler words")
+    if metrics['eye_contact_score'] > 70:
+        strengths.append("Strong audience engagement")
+    if metrics['word_count'] > 80:
+        strengths.append("Comprehensive content coverage")
+    
+    if not strengths:
+        strengths = ["Willingness to practice", "Taking initiative to improve", "Self-awareness"]
+    
+    for i, strength in enumerate(strengths[:3], 1):
+        feedback += f"{i}. {strength}\n"
+    
+    feedback += "\n**🎯 Priority Improvements:**\n"
+    improvements = []
+    if metrics['filler_count'] > 5:
+        improvements.append(f"Reduce filler words - currently at {metrics['filler_count']}, target <5")
+    if metrics['eye_contact_score'] < 70:
+        improvements.append(f"Increase eye contact from {metrics['eye_contact_score']:.0f}% to 75%+")
+    if metrics['wpm'] < 120:
+        improvements.append(f"Increase speaking pace from {metrics['wpm']:.0f} to 120+ WPM")
+    if metrics['wpm'] > 180:
+        improvements.append(f"Decrease speaking pace from {metrics['wpm']:.0f} to 150-170 WPM")
+    if metrics['word_count'] < 50:
+        improvements.append("Develop more substantial content")
+    
+    if not improvements:
+        improvements = ["Maintain current performance", "Add more vocal variety", "Incorporate strategic pauses"]
+    
+    for i, improvement in enumerate(improvements[:3], 1):
+        feedback += f"{i}. {improvement}\n"
+    
+    return feedback
 
 # Helper Functions
 def save_session(data):
@@ -79,12 +320,15 @@ def save_session(data):
     c = conn.cursor()
     c.execute('''INSERT INTO sessions 
                  (date, duration, wpm, filler_count, eye_contact_score, 
-                  emotion_scores, pause_count, overall_score, transcript)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  emotion_scores, pause_count, overall_score, transcript, ai_feedback,
+                  confidence_score, clarity_score, engagement_score)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (data['date'], data['duration'], data['wpm'], 
                data['filler_count'], data['eye_contact_score'],
                json.dumps(data['emotion_scores']), data['pause_count'],
-               data['overall_score'], data.get('transcript', '')))
+               data['overall_score'], data.get('transcript', ''),
+               data.get('ai_feedback', ''), data.get('confidence_score', 0),
+               data.get('clarity_score', 0), data.get('engagement_score', 0)))
     conn.commit()
     conn.close()
 
@@ -95,956 +339,1294 @@ def get_session_history():
     return df
 
 def analyze_speech_text(text):
-    """Analyze transcribed speech for fillers, pace, and word count"""
+    """Advanced speech analysis"""
     if not text or len(text.strip()) == 0:
-        return {'word_count': 0, 'filler_count': 0, 'pause_count': 0}
+        return {'word_count': 0, 'filler_count': 0, 'pause_count': 0, 'unique_words': 0, 'avg_word_length': 0}
     
     words = text.lower().split()
     word_count = len(words)
+    unique_words = len(set(words))
     
     # Filler words detection
-    filler_words = ['um', 'uh', 'like', 'so', 'actually', 'basically', 'literally', 'you know']
-    filler_count = 0
-    for word in words:
-        if word in filler_words:
-            filler_count += 1
+    filler_words = ['um', 'uh', 'like', 'so', 'actually', 'basically', 'literally', 'you know', 'i mean', 'kind of', 'sort of']
+    filler_count = sum(text.lower().count(filler) for filler in filler_words)
     
-    # Count "you know" as phrase
-    text_lower = text.lower()
-    filler_count += text_lower.count('you know')
+    # Average word length
+    avg_word_length = sum(len(word) for word in words) / len(words) if words else 0
     
     # Pause detection
-    pause_indicators = text.count('...') + text.count('..') + len([w for w in text.split() if len(w) == 0])
+    pause_indicators = text.count('...') + text.count('..') + text.count(' - ')
     
     return {
         'word_count': word_count,
         'filler_count': filler_count,
-        'pause_count': max(0, pause_indicators)
+        'pause_count': max(0, pause_indicators),
+        'unique_words': unique_words,
+        'avg_word_length': avg_word_length
     }
 
+# IMPROVED: Robust face and eye detection
 def detect_face_and_eyes(frame):
-    """Detect face and eyes for eye contact estimation"""
+    """Enhanced face and eye detection with better error handling"""
     try:
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        if st.session_state.face_cascade is None or st.session_state.eye_cascade is None:
+            return False, False, 0
         
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        # Convert to grayscale with error handling
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        except:
+            return False, False, 0
+        
+        # Apply histogram equalization for better detection
+        gray = cv2.equalizeHist(gray)
+        
+        # IMPROVED: Better parameters for face detection
+        faces = st.session_state.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,  # More sensitive
+            minNeighbors=5,   # Balance between false positives and detection
+            minSize=(60, 60), # Larger minimum size
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
         
         eye_contact = False
         face_detected = False
+        face_size = 0
         
         for (x, y, w, h) in faces:
             face_detected = True
+            face_size = w * h
+            
+            # Draw face rectangle
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
+            
+            # Extract face ROI for eye detection
             roi_gray = gray[y:y+h, x:x+w]
-            eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 5)
+            roi_color = frame[y:y+h, x:x+w]
+            
+            # IMPROVED: Better parameters for eye detection
+            eyes = st.session_state.eye_cascade.detectMultiScale(
+                roi_gray,
+                scaleFactor=1.05,
+                minNeighbors=7,    # Reduced false positives
+                minSize=(20, 20),
+                maxSize=(80, 80)
+            )
+            
             if len(eyes) >= 2:
                 eye_contact = True
-                break
-        
-        return eye_contact, face_detected
-    except:
-        return False, False
-
-def simple_emotion_detection(frame):
-    """Simple emotion detection based on facial features"""
-    try:
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
-        
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-        
-        if len(faces) == 0:
-            return 'neutral'
-        
-        for (x, y, w, h) in faces:
-            roi_gray = gray[y:y+h, x:x+w]
-            smiles = smile_cascade.detectMultiScale(roi_gray, 1.8, 20)
+                # Draw eye rectangles
+                for (ex, ey, ew, eh) in eyes[:2]:  # Only first two eyes
+                    cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (255, 0, 0), 2)
             
-            if len(smiles) > 0:
-                return 'happy'
-            else:
-                return 'confident'
+            break  # Only process first face
         
-        return 'neutral'
-    except:
-        return 'neutral'
+        return eye_contact, face_detected, face_size
+    
+    except Exception as e:
+        print(f"Face detection error: {str(e)}")
+        return False, False, 0
 
+def calculate_advanced_scores(metrics, transcript):
+    """Calculate advanced presentation scores"""
+    
+    # Confidence Score
+    confidence = 100
+    if metrics['wpm'] < 100:
+        confidence -= 20
+    if metrics['filler_count'] > 10:
+        confidence -= 30
+    elif metrics['filler_count'] > 5:
+        confidence -= 15
+    
+    confidence_score = max(0, min(100, confidence))
+    
+    # Clarity Score
+    clarity = 100
+    if metrics['filler_count'] > 8:
+        clarity -= 25
+    if metrics['wpm'] > 200:
+        clarity -= 20
+    if metrics.get('unique_words', 0) > 0 and metrics['word_count'] > 0:
+        vocabulary_ratio = metrics['unique_words'] / metrics['word_count']
+        if vocabulary_ratio < 0.3:
+            clarity -= 10
+    
+    clarity_score = max(0, min(100, clarity))
+    
+    # Engagement Score
+    engagement = metrics['eye_contact_score']
+    if 120 <= metrics['wpm'] <= 180:
+        engagement += 10
+    engagement = min(100, engagement)
+    
+    engagement_score = max(0, min(100, engagement))
+    
+    return confidence_score, clarity_score, engagement_score
+
+# IMPROVED: Speech recognition with better error handling
 def record_audio_continuous(duration, result_queue, mic_index=None):
-    """Record audio continuously and convert to text"""
+    """Enhanced audio recording with better noise handling"""
     recognizer = sr.Recognizer()
+    
+    # IMPROVED: Better recognition parameters
     recognizer.dynamic_energy_threshold = True
-    recognizer.energy_threshold = 300  # Lower threshold for better detection
+    recognizer.energy_threshold = 400  # Increased for better noise rejection
+    recognizer.pause_threshold = 0.8
+    recognizer.phrase_threshold = 0.3
     
     full_text = ""
     
     try:
-        # Use specific microphone or default
         if mic_index is not None:
             mic = sr.Microphone(device_index=mic_index)
         else:
             mic = sr.Microphone()
         
         with mic as source:
-            # Adjust for ambient noise
-            recognizer.adjust_for_ambient_noise(source, duration=1)
+            print("Adjusting for ambient noise...")
+            recognizer.adjust_for_ambient_noise(source, duration=2)
             
             start_time = time.time()
+            chunks_processed = 0
             
-            # Record in chunks
             while time.time() - start_time < duration:
                 try:
                     remaining = duration - (time.time() - start_time)
                     if remaining <= 0:
                         break
                     
-                    chunk_duration = min(4, remaining)
+                    chunk_duration = min(5, remaining)
                     audio = recognizer.listen(source, timeout=chunk_duration, phrase_time_limit=chunk_duration)
                     
                     try:
-                        text = recognizer.recognize_google(audio)
+                        text = recognizer.recognize_google(audio, language='en-US', show_all=False)
                         if text:
                             full_text += " " + text
-                            print(f"Recognized: {text}")  # Debug output
+                            chunks_processed += 1
+                            print(f"Recognized chunk {chunks_processed}: {text[:50]}...")
                     except sr.UnknownValueError:
-                        print("Could not understand audio")
+                        print(f"Could not understand chunk {chunks_processed}")
                         continue
                     except sr.RequestError as e:
                         print(f"API error: {e}")
                         continue
                         
-                except sr.WaitTimeoutError:
-                    print("Listening timeout, continuing...")
-                    continue
                 except Exception as e:
-                    print(f"Chunk error: {e}")
+                    print(f"Listen error: {e}")
                     continue
                     
     except Exception as e:
-        print(f"Audio recording error: {e}")
         result_queue.put(f"ERROR: {str(e)}")
         return
     
-    result_queue.put(full_text.strip())
+    final_text = full_text.strip()
+    print(f"Total text recognized: {len(final_text)} characters")
+    result_queue.put(final_text if final_text else "")
 
 def calculate_overall_score(metrics):
-    """Calculate overall presentation score"""
+    """Enhanced scoring algorithm"""
     score = 100
     
-    # Deduct for fillers (max -20)
-    filler_penalty = min(metrics['filler_count'] * 2, 20)
-    score -= filler_penalty
-    
-    # Deduct for poor eye contact (max -25)
-    eye_contact_penalty = (100 - metrics['eye_contact_score']) * 0.25
-    score -= eye_contact_penalty
-    
-    # Deduct for poor pacing (max -15)
-    if metrics['wpm'] < 120 or metrics['wpm'] > 180:
-        pace_penalty = min(abs(150 - metrics['wpm']) * 0.3, 15)
-        score -= pace_penalty
-    
-    # Deduct for low word count (max -10)
-    if metrics['word_count'] < 20:
+    # Filler words penalty (max -25)
+    if metrics['filler_count'] > 15:
+        score -= 25
+    elif metrics['filler_count'] > 10:
+        score -= 20
+    elif metrics['filler_count'] > 5:
         score -= 10
+    elif metrics['filler_count'] > 3:
+        score -= 5
+    
+    # Eye contact penalty (max -25)
+    if metrics['eye_contact_score'] < 40:
+        score -= 25
+    elif metrics['eye_contact_score'] < 60:
+        score -= 15
+    elif metrics['eye_contact_score'] < 75:
+        score -= 8
+    
+    # Pacing penalty (max -20)
+    if metrics['wpm'] < 100:
+        score -= 20
+    elif metrics['wpm'] < 120:
+        score -= 10
+    elif metrics['wpm'] > 200:
+        score -= 20
+    elif metrics['wpm'] > 180:
+        score -= 10
+    
+    # Content penalty (max -15)
+    if metrics['word_count'] < 20:
+        score -= 15
+    elif metrics['word_count'] < 40:
+        score -= 8
+    
+    # Bonus for excellence
+    if metrics['wpm'] >= 140 and metrics['wpm'] <= 160:
+        score += 5
+    if metrics['eye_contact_score'] > 85:
+        score += 5
     
     return max(0, min(100, score))
 
-def generate_feedback(metrics):
-    """Generate personalized feedback based on metrics"""
-    feedback = []
+def plot_advanced_metrics(metrics, history_df=None):
+    """Create professional visualization dashboard"""
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
     
-    # WPM feedback
-    if metrics['wpm'] < 120:
-        feedback.append(f"🐢 **Pacing**: Your speech pace is slow ({int(metrics['wpm'])} wpm). Try to speak a bit faster for better engagement. Target: 120-180 wpm")
-    elif metrics['wpm'] > 180:
-        feedback.append(f"🏃 **Pacing**: You're speaking quite fast ({int(metrics['wpm'])} wpm). Slow down to ensure clarity. Target: 120-180 wpm")
-    else:
-        feedback.append(f"✅ **Pacing**: Excellent pace ({int(metrics['wpm'])} wpm)! You're in the ideal range (120-180 wpm).")
+    primary_color = '#667eea'
+    secondary_color = '#764ba2'
     
-    # Filler words feedback
-    if metrics['filler_count'] > 10:
-        feedback.append(f"⚠️ **Filler Words**: High filler word usage ({metrics['filler_count']} detected). Practice pausing instead of using fillers like 'um', 'uh', 'like'.")
-    elif metrics['filler_count'] > 5:
-        feedback.append(f"⚡ **Filler Words**: Moderate filler usage ({metrics['filler_count']}). Try to reduce them further with conscious pauses.")
-    else:
-        feedback.append(f"✅ **Filler Words**: Great job! Minimal filler words detected ({metrics['filler_count']}).")
+    # 1. Overall Score Gauge
+    ax1 = fig.add_subplot(gs[0, :2])
+    score = metrics['overall_score']
+    colors_map = ['#e74c3c', '#e67e22', '#f39c12', '#2ecc71', '#27ae60']
+    color_idx = min(int(score / 20), 4)
     
-    # Eye contact feedback
-    if metrics['eye_contact_score'] < 50:
-        feedback.append(f"👀 **Eye Contact**: Low eye contact ({int(metrics['eye_contact_score'])}%). Look more directly at the camera. Aim for 70%+")
-    elif metrics['eye_contact_score'] < 75:
-        feedback.append(f"👁️ **Eye Contact**: Good eye contact ({int(metrics['eye_contact_score'])}%). Keep improving to reach 75%+!")
-    else:
-        feedback.append(f"✅ **Eye Contact**: Excellent engagement ({int(metrics['eye_contact_score'])}%)! Well done.")
+    ax1.barh([0], [score], color=colors_map[color_idx], height=0.5, alpha=0.8)
+    ax1.set_xlim(0, 100)
+    ax1.set_ylim(-0.5, 0.5)
+    ax1.set_xlabel('Overall Score', fontsize=14, fontweight='bold')
+    ax1.set_yticks([])
+    ax1.text(score + 2, 0, f'{score:.1f}', va='center', fontsize=20, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    ax1.set_title('Overall Presentation Score', fontsize=16, fontweight='bold', pad=20)
     
-    # Emotion feedback
-    if metrics['dominant_emotion'] == 'neutral':
-        feedback.append("😐 **Expression**: Your expression appeared mostly neutral. Try to show more enthusiasm and energy!")
-    elif metrics['dominant_emotion'] == 'happy':
-        feedback.append("😊 **Expression**: Great positive energy! Your expressions were engaging.")
-    else:
-        feedback.append(f"✅ **Expression**: You projected {metrics['dominant_emotion']} demeanor. Keep it natural!")
+    # 2. Multi-dimensional scores
+    ax2 = fig.add_subplot(gs[0, 2])
+    categories = ['Confidence', 'Clarity', 'Engagement']
+    scores = [
+        metrics.get('confidence_score', 70),
+        metrics.get('clarity_score', 70),
+        metrics.get('engagement_score', 70)
+    ]
+    colors = ['#667eea', '#764ba2', '#f093fb']
+    ax2.bar(categories, scores, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel('Score', fontsize=11, fontweight='bold')
+    ax2.set_title('Skill Breakdown', fontsize=12, fontweight='bold')
+    ax2.grid(axis='y', alpha=0.3)
+    for i, v in enumerate(scores):
+        ax2.text(i, v + 3, f'{v:.0f}', ha='center', fontweight='bold')
     
-    # Word count feedback
-    if metrics['word_count'] < 30:
-        feedback.append(f"📝 **Content**: Only {metrics['word_count']} words detected. Try speaking more to get better analysis.")
+    # 3. WPM Analysis
+    ax3 = fig.add_subplot(gs[1, 0])
+    wpm = metrics['wpm']
+    optimal_range = [120, 180]
+    ax3.axhspan(optimal_range[0], optimal_range[1], alpha=0.3, color='green', label='Optimal Range')
+    ax3.barh(['Your WPM'], [wpm], color=primary_color, height=0.4, alpha=0.8)
+    ax3.set_xlim(0, max(250, wpm + 20))
+    ax3.set_xlabel('Words Per Minute', fontsize=11)
+    ax3.set_title('Speaking Pace Analysis', fontsize=12, fontweight='bold')
+    ax3.legend(loc='lower right', fontsize=8)
+    ax3.text(wpm + 5, 0, f'{wpm:.0f}', va='center', fontsize=14, fontweight='bold')
     
-    return feedback
-
-def plot_metrics(metrics, history_df=None):
-    """Create visualization of metrics"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle('Presentation Analysis Dashboard', fontsize=16, fontweight='bold')
+    # 4. Filler Words
+    ax4 = fig.add_subplot(gs[1, 1])
+    filler_data = [metrics['filler_count'], max(0, 15 - metrics['filler_count'])]
+    colors_filler = ['#e74c3c', '#2ecc71']
+    ax4.pie(filler_data, labels=['Fillers', 'Clean Speech'], autopct='%1.1f%%',
+            colors=colors_filler, startangle=90, textprops={'fontsize': 10, 'fontweight': 'bold'})
+    ax4.set_title(f'Filler Words: {metrics["filler_count"]}', fontsize=12, fontweight='bold')
     
-    # Current session metrics
-    categories = ['Overall\nScore', 'Eye Contact', 'Pace\nScore', 'Fluency\nScore']
-    pace_score = 100 if 120 <= metrics['wpm'] <= 180 else max(0, 100 - abs(150 - metrics['wpm']) * 0.5)
-    fluency_score = max(0, 100 - metrics['filler_count'] * 3)
-    scores = [metrics['overall_score'], metrics['eye_contact_score'], pace_score, fluency_score]
+    # 5. Eye Contact
+    ax5 = fig.add_subplot(gs[1, 2])
+    eye_score = metrics['eye_contact_score']
+    remaining = 100 - eye_score
+    colors_eye = ['#667eea', '#e0e0e0']
+    ax5.pie([eye_score, remaining], labels=['Eye Contact', 'Away'],
+            autopct='%1.1f%%', colors=colors_eye, startangle=90,
+            textprops={'fontsize': 10, 'fontweight': 'bold'})
+    ax5.set_title('Eye Contact Distribution', fontsize=12, fontweight='bold')
     
-    colors = ['#2ecc71' if s >= 75 else '#f39c12' if s >= 50 else '#e74c3c' for s in scores]
-    axes[0, 0].bar(categories, scores, color=colors, edgecolor='black', linewidth=1.5)
-    axes[0, 0].set_ylim(0, 100)
-    axes[0, 0].set_ylabel('Score (%)', fontsize=11)
-    axes[0, 0].set_title('Current Session Scores', fontsize=12, fontweight='bold')
-    axes[0, 0].grid(axis='y', alpha=0.3)
-    
-    # Metrics breakdown
-    metric_names = ['Words', 'Fillers', 'Pauses', 'Duration(s)']
-    metric_values = [metrics['word_count'], metrics['filler_count'], 
-                     metrics['pause_count'], int(metrics['duration'])]
-    axes[0, 1].barh(metric_names, metric_values, color='#3498db', edgecolor='black', linewidth=1.5)
-    axes[0, 1].set_xlabel('Count', fontsize=11)
-    axes[0, 1].set_title('Session Metrics', fontsize=12, fontweight='bold')
-    axes[0, 1].grid(axis='x', alpha=0.3)
-    
-    # Historical trend
+    # 6. Historical Trend
+    ax6 = fig.add_subplot(gs[2, :])
     if history_df is not None and len(history_df) > 1:
         recent = history_df.head(10).iloc[::-1]
-        axes[1, 0].plot(range(len(recent)), recent['overall_score'], 
-                       marker='o', color='#9b59b6', linewidth=2, markersize=8)
-        axes[1, 0].set_xlabel('Session Number (Recent)', fontsize=11)
-        axes[1, 0].set_ylabel('Overall Score', fontsize=11)
-        axes[1, 0].set_title('Progress Over Time', fontsize=12, fontweight='bold')
-        axes[1, 0].grid(True, alpha=0.3)
-        axes[1, 0].set_ylim(0, 100)
+        sessions = range(1, len(recent) + 1)
+        
+        ax6.plot(sessions, recent['overall_score'], marker='o', linewidth=3,
+                color=primary_color, markersize=10, label='Overall Score')
+        ax6.plot(sessions, recent['eye_contact_score'], marker='s', linewidth=2,
+                color=secondary_color, markersize=8, alpha=0.7, label='Eye Contact')
+        
+        ax6.set_xlabel('Session Number', fontsize=12, fontweight='bold')
+        ax6.set_ylabel('Score', fontsize=12, fontweight='bold')
+        ax6.set_title('Performance Progression', fontsize=14, fontweight='bold')
+        ax6.legend(loc='best', fontsize=10)
+        ax6.grid(True, alpha=0.3)
+        ax6.set_ylim(0, 105)
+        
+        z = np.polyfit(sessions, recent['overall_score'], 1)
+        p = np.poly1d(z)
+        ax6.plot(sessions, p(sessions), "--", alpha=0.5, color='gray', label='Trend')
     else:
-        axes[1, 0].text(0.5, 0.5, 'Complete more sessions\nto see progress', 
-                       ha='center', va='center', fontsize=12)
-        axes[1, 0].set_title('Progress Over Time', fontsize=12, fontweight='bold')
+        ax6.text(0.5, 0.5, 'Complete more sessions to see progression',
+                ha='center', va='center', fontsize=14, transform=ax6.transAxes)
+        ax6.set_title('Performance Progression', fontsize=14, fontweight='bold')
     
-    # Emotion distribution
-    if 'emotion_scores' in metrics and metrics['emotion_scores']:
-        emotions = list(metrics['emotion_scores'].keys())
-        counts = list(metrics['emotion_scores'].values())
-        if sum(counts) > 0:
-            axes[1, 1].pie(counts, labels=emotions, autopct='%1.1f%%', 
-                          startangle=90, textprops={'fontsize': 10})
-            axes[1, 1].set_title('Emotion Distribution', fontsize=12, fontweight='bold')
-        else:
-            axes[1, 1].text(0.5, 0.5, 'No emotion data', ha='center', va='center', fontsize=12)
-            axes[1, 1].set_title('Emotion Distribution', fontsize=12, fontweight='bold')
-    else:
-        axes[1, 1].text(0.5, 0.5, 'No emotion data', ha='center', va='center', fontsize=12)
-        axes[1, 1].set_title('Emotion Distribution', fontsize=12, fontweight='bold')
+    plt.suptitle('🎯 Comprehensive Presentation Analytics', fontsize=18, fontweight='bold', y=0.995)
     
-    plt.tight_layout()
     return fig
 
-# Main UI
-st.title("🎤 AI Presentation Coach - Live Recording")
-st.markdown("### Practice your presentations with real-time analysis")
+def test_microphone():
+    """Test microphone functionality"""
+    recognizer = sr.Recognizer()
+    try:
+        mic_list = sr.Microphone.list_microphone_names()
+        if not mic_list:
+            return False, "No microphones found", []
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            return True, f"Microphone working! Found {len(mic_list)} device(s)", mic_list
+    except Exception as e:
+        return False, f"Microphone error: {str(e)}", []
+
+# Main Application
+st.markdown('<h1 class="main-header">🎯 AI Presentation Coach Pro</h1>', unsafe_allow_html=True)
+st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Advanced Multimodal Analysis with AI-Powered Insights</p>', unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
-    st.header("📊 Dashboard")
-    page = st.radio("Navigation", ["Live Practice", "Microphone Test", "History & Progress", "About"])
-
-if page == "Microphone Test":
-    st.header("🎤 Microphone Diagnostics")
+    st.image("https://img.icons8.com/fluency/96/000000/microphone.png", width=80)
+    st.title("🎛️ Control Panel")
     
-    st.markdown("""
-    ### Test your microphone before recording
-    This will help identify and fix any audio issues.
-    """)
-    
-    if st.button("🔍 Test Microphone", type="primary"):
-        with st.spinner("Testing microphone..."):
-            success, message, mic_list = test_microphone()
-            
-            if success:
-                st.success(f"✅ {message}")
-                
-                st.subheader("Available Microphones:")
-                for i, mic_name in enumerate(mic_list):
-                    st.write(f"{i}. {mic_name}")
-                
-                st.info("💡 Your default microphone is working! You can now use Live Practice.")
-                
-            else:
-                st.error(f"❌ {message}")
-                
-                st.markdown("""
-                ### Troubleshooting Steps:
-                
-                #### Windows:
-                1. **Check Privacy Settings:**
-                   - Go to Settings > Privacy > Microphone
-                   - Enable "Allow apps to access your microphone"
-                   - Scroll down and enable for Python/VS Code
-                
-                2. **Check Device Manager:**
-                   - Right-click Start > Device Manager
-                   - Expand "Audio inputs and outputs"
-                   - Make sure microphone is enabled
-                
-                3. **Test in Sound Settings:**
-                   - Right-click speaker icon > Sounds
-                   - Go to Recording tab
-                   - Speak and check if the bar moves
-                
-                #### Mac:
-                1. **Check System Preferences:**
-                   - Go to System Preferences > Security & Privacy
-                   - Click Microphone tab
-                   - Enable Terminal/VS Code/iTerm
-                
-                2. **Test microphone:**
-                   - Open QuickTime Player
-                   - File > New Audio Recording
-                   - Check if it detects sound
-                
-                #### Linux:
-                ```bash
-                # Check microphone
-                arecord -l
-                
-                # Test recording
-                arecord -d 5 test.wav
-                aplay test.wav
-                ```
-                
-                #### Common Issues:
-                - **No microphone found**: Check if microphone is plugged in
-                - **Permission denied**: Grant microphone permissions to Terminal/Python
-                - **Device in use**: Close other applications using microphone
-                - **Wrong default device**: Set correct default in system settings
-                """)
+    page = st.radio("", [
+        "🎤 Live Practice",
+        "🧪 System Check",
+        "📊 Analytics Dashboard",
+        "⚙️ AI Settings",
+        "ℹ️ About Project"
+    ], label_visibility="collapsed")
     
     st.markdown("---")
-    st.subheader("🎙️ Quick Microphone Test")
+    st.markdown("### 📈 Quick Stats")
+    history_df = get_session_history()
+    if len(history_df) > 0:
+        st.metric("Total Sessions", len(history_df))
+        st.metric("Avg Score", f"{history_df['overall_score'].mean():.1f}")
+        st.metric("Best Score", f"{history_df['overall_score'].max():.1f}")
+    else:
+        st.info("No sessions yet")
     
-    recognizer = sr.Recognizer()
-    
-    if st.button("🔴 Record 3 Seconds"):
-        try:
-            with sr.Microphone() as source:
-                st.info("🎤 Listening... Speak now!")
-                recognizer.adjust_for_ambient_noise(source, duration=1)
-                audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
-                
-                st.success("✅ Audio captured! Processing...")
-                
-                try:
-                    text = recognizer.recognize_google(audio)
-                    st.success(f"**Recognized:** {text}")
-                except sr.UnknownValueError:
-                    st.warning("⚠️ Could not understand audio. Speak louder and clearer.")
-                except sr.RequestError:
-                    st.error("❌ Could not request results. Check internet connection.")
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
-            st.info("Make sure microphone permissions are granted!")
+    st.markdown("---")
+    st.markdown("### 🎓 DES646 Project")
+    st.caption("Team: Surya, Pushpendra, Meet, Vasundhara, Ayush")
 
-elif page == "Live Practice":
-    st.header("🎥 Live Recording Session")
+# PAGE 1: LIVE PRACTICE
+if "🎤 Live Practice" in page:
+    st.header("🎥 Professional Practice Session")
+    
+    duration_options = {
+        "30 seconds - Quick Practice": 30,
+        "1 minute - Short Pitch": 60,
+        "2 minutes - Standard Presentation": 120,
+        "3 minutes - Detailed Presentation": 180,
+        "5 minutes - Full Presentation": 300
+    }
+    
+    if not st.session_state.recording and not st.session_state.analysis_complete:
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            st.markdown("""
+            <div class="feedback-box">
+            <h3 style="color: #2c3e50 !important;">📋 Session Guidelines</h3>
+            <ul style="color: #2c3e50 !important;">
+                <li><strong>Environment:</strong> Quiet space with good lighting</li>
+                <li><strong>Position:</strong> Face camera directly, maintain eye contact</li>
+                <li><strong>Delivery:</strong> Speak clearly at conversational pace</li>
+                <li><strong>Content:</strong> Present as if to a real audience</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            selected_duration = st.selectbox(
+                "🕒 Select Duration:",
+                options=list(duration_options.keys()),
+                index=2
+            )
+            
+            st.session_state.selected_duration = selected_duration
+            duration = duration_options[selected_duration]
+            
+            try:
+                mic_list = sr.Microphone.list_microphone_names()
+                if len(mic_list) > 1:
+                    mic_choice = st.selectbox(
+                        "🎤 Select Microphone:",
+                        options=["Default (Recommended)"] + [f"Device {i}: {name[:30]}" for i, name in enumerate(mic_list)]
+                    )
+                    if "Device" in mic_choice:
+                        st.session_state.selected_mic_index = int(mic_choice.split()[1].replace(":", ""))
+                    else:
+                        st.session_state.selected_mic_index = None
+                else:
+                    st.session_state.selected_mic_index = None
+            except:
+                st.session_state.selected_mic_index = None
+            
+            st.markdown("---")
+            
+            if st.button("🔴 START RECORDING", type="primary", use_container_width=True):
+                success, _, _ = test_microphone()
+                if not success:
+                    st.error("❌ Microphone not detected! Please check System Check page.")
+                else:
+                    st.session_state.recording = True
+                    st.rerun()
+        
+        with col2:
+            st.markdown("""
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 15px;">
+            <h3 style="color: white !important; margin-bottom: 1rem;">🎯 Target Metrics</h3>
+            <ul style="color: white !important; list-style: none; padding-left: 0;">
+                <li style="color: white !important; margin-bottom: 0.5rem;"><strong style="color: white !important;">WPM:</strong> 120-180</li>
+                <li style="color: white !important; margin-bottom: 0.5rem;"><strong style="color: white !important;">Fillers:</strong> < 5</li>
+                <li style="color: white !important; margin-bottom: 0.5rem;"><strong style="color: white !important;">Eye Contact:</strong> > 75%</li>
+                <li style="color: white !important;"><strong style="color: white !important;">Score:</strong> 80+</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown("""
+            <div style="background: #f8f9fa; padding: 1.5rem; border-radius: 15px; border: 2px solid #667eea;">
+            <h3 style="color: #2c3e50 !important;">💡 Pro Tips</h3>
+            <ul style="color: #2c3e50 !important;">
+                <li>Breathe deeply first</li>
+                <li>Smile naturally</li>
+                <li>Use gestures</li>
+                <li>Pause for emphasis</li>
+                <li>Be authentic</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    elif st.session_state.recording:
+        selected_duration = st.session_state.selected_duration
+        duration = duration_options[selected_duration]
+        
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); padding: 2rem; border-radius: 15px; text-align: center; margin-bottom: 2rem;">
+        <h2 style="color: white; margin: 0;">🔴 RECORDING IN PROGRESS</h2>
+        <p style="color: white; margin: 0.5rem 0 0 0; font-size: 1.2rem;">{selected_duration.split(' - ')[0]}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        video_placeholder = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        metrics_display = st.empty()
+        
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            st.error("❌ Could not access webcam. Please check your camera permissions.")
+            st.session_state.recording = False
+            st.stop()
+        
+        audio_queue = queue.Queue()
+        audio_thread = threading.Thread(
+            target=record_audio_continuous,
+            args=(duration, audio_queue, st.session_state.selected_mic_index)
+        )
+        audio_thread.start()
+        
+        start_time = time.time()
+        frame_count = 0
+        eye_contact_frames = 0
+        total_frames = 0
+        emotion_list = []
+        face_sizes = []
+        
+        while time.time() - start_time < duration:
+            ret, frame = cap.read()
+            
+            if not ret:
+                break
+            
+            frame = cv2.flip(frame, 1)
+            
+            eye_contact, face_detected, face_size = detect_face_and_eyes(frame)
+            
+            if face_detected:
+                total_frames += 1
+                face_sizes.append(face_size)
+                if eye_contact:
+                    eye_contact_frames += 1
+                    emotion_list.append('confident')
+                else:
+                    emotion_list.append('neutral')
+                
+                # IMPROVED: UTF-8 safe text overlay
+                cv2.putText(frame, "Face: OK", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                if eye_contact:
+                    cv2.putText(frame, "Eye Contact: GOOD", (10, 65),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                else:
+                    cv2.putText(frame, "Eye Contact: WEAK", (10, 65),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 140, 0), 2)
+            else:
+                cv2.putText(frame, "Face: NOT DETECTED", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            elapsed = time.time() - start_time
+            remaining = duration - elapsed
+            cv2.putText(frame, f"Time: {int(remaining)}s", (frame.shape[1] - 150, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+            
+            progress = min(elapsed / duration, 1.0)
+            progress_bar.progress(progress)
+            status_text.markdown(f"**Recording:** {int(elapsed)}s / {duration}s")
+            
+            if total_frames > 0:
+                current_eye_contact = (eye_contact_frames / total_frames) * 100
+                metrics_display.markdown(f"""
+                <div style="background: #f8f9fa; padding: 1rem; border-radius: 10px; color: #2c3e50 !important;">
+                <strong>Live Metrics:</strong> Eye Contact: {current_eye_contact:.0f}% | Frames: {total_frames}
+                </div>
+                """, unsafe_allow_html=True)
+            
+            frame_count += 1
+            time.sleep(0.03)
+        
+        cap.release()
+        st.session_state.recording = False
+        
+        status_text.markdown("**⏳ Processing audio... Please wait...**")
+        audio_thread.join(timeout=10)
+        
+        try:
+            transcribed_text = audio_queue.get_nowait()
+            if transcribed_text.startswith("ERROR:"):
+                transcribed_text = ""
+        except:
+            transcribed_text = ""
+        
+        speech_metrics = analyze_speech_text(transcribed_text)
+        
+        wpm = (speech_metrics['word_count'] / duration) * 60 if duration > 0 else 0
+        eye_contact_score = (eye_contact_frames / total_frames) * 100 if total_frames > 0 else 0
+        
+        emotion_counter = Counter(emotion_list)
+        emotion_scores = dict(emotion_counter)
+        dominant_emotion = max(emotion_scores, key=emotion_scores.get) if emotion_scores else 'neutral'
+        
+        metrics = {
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'duration': duration,
+            'wpm': wpm,
+            'word_count': speech_metrics['word_count'],
+            'filler_count': speech_metrics['filler_count'],
+            'pause_count': speech_metrics['pause_count'],
+            'eye_contact_score': eye_contact_score,
+            'emotion_scores': emotion_scores,
+            'dominant_emotion': dominant_emotion,
+            'transcript': transcribed_text,
+            'unique_words': speech_metrics.get('unique_words', 0),
+            'avg_word_length': speech_metrics.get('avg_word_length', 0),
+            'overall_score': 0
+        }
+        
+        confidence_score, clarity_score, engagement_score = calculate_advanced_scores(metrics, transcribed_text)
+        metrics['confidence_score'] = confidence_score
+        metrics['clarity_score'] = clarity_score
+        metrics['engagement_score'] = engagement_score
+        
+        metrics['overall_score'] = calculate_overall_score(metrics)
+        
+        status_text.markdown("**🤖 Generating AI insights...**")
+        ai_feedback = get_gemini_feedback(transcribed_text, metrics)
+        metrics['ai_feedback'] = ai_feedback
+        
+        save_session(metrics)
+        
+        st.session_state.session_data = metrics
+        st.session_state.analysis_complete = True
+        
+        st.success("✅ Analysis Complete!")
+        time.sleep(1)
+        st.rerun()
+    
+    elif st.session_state.analysis_complete:
+        metrics = st.session_state.session_data
+        
+        st.markdown("---")
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col2:
+            score = metrics['overall_score']
+            if score >= 85:
+                score_class = "score-excellent"
+                emoji = "🌟"
+                level = "OUTSTANDING"
+                message = "Exceptional performance! You're presentation-ready!"
+            elif score >= 75:
+                score_class = "score-excellent"
+                emoji = "⭐"
+                level = "EXCELLENT"
+                message = "Great job! Minor refinements will make you perfect!"
+            elif score >= 65:
+                score_class = "score-good"
+                emoji = "👍"
+                level = "GOOD"
+                message = "Solid performance with room for improvement!"
+            elif score >= 50:
+                score_class = "score-good"
+                emoji = "📈"
+                level = "DEVELOPING"
+                message = "You're on the right track. Keep practicing!"
+            else:
+                score_class = "score-poor"
+                emoji = "💪"
+                level = "NEEDS WORK"
+                message = "Focus on the feedback. Improvement is coming!"
+            
+            st.markdown(f"""
+            <div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border-radius: 20px; border: 3px solid #667eea;">
+                <div class="{score_class}">{emoji} {score:.1f}</div>
+                <h2 style="margin: 0; color: #667eea;">{level}</h2>
+                <p style="font-size: 1.1rem; color: #666; margin-top: 1rem;">{message}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            wpm = metrics['wpm']
+            wpm_status = "🟢" if 120 <= wpm <= 180 else "🟡" if 100 <= wpm <= 200 else "🔴"
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h3 style="color: white; margin: 0;">{wpm_status} {wpm:.0f}</h3>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Words/Minute</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            fillers = metrics['filler_count']
+            filler_status = "🟢" if fillers < 5 else "🟡" if fillers < 10 else "🔴"
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h3 style="color: white; margin: 0;">{filler_status} {fillers}</h3>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Filler Words</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            eye_contact = metrics['eye_contact_score']
+            eye_status = "🟢" if eye_contact > 75 else "🟡" if eye_contact > 60 else "🔴"
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h3 style="color: white; margin: 0;">{eye_status} {eye_contact:.0f}%</h3>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Eye Contact</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            confidence = metrics.get('confidence_score', 70)
+            conf_status = "🟢" if confidence > 75 else "🟡" if confidence > 60 else "🔴"
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h3 style="color: white; margin: 0;">{conf_status} {confidence:.0f}%</h3>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Confidence</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        if metrics.get('transcript') and len(metrics['transcript']) > 10:
+            with st.expander("📝 Full Transcript", expanded=False):
+                st.markdown(f"""
+                <div class="feedback-box">
+                <p style="font-size: 1.1rem; line-height: 1.8; color: #2c3e50 !important;">{metrics['transcript']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.warning("""
+            ⚠️ **Limited/No Speech Detected**
+            
+            **Possible reasons:**
+            - Microphone was muted
+            - Background noise too high
+            - Speaking too softly
+            - Internet connection issue
+            
+            **Solutions:**
+            - Check microphone settings
+            - Test in System Check page
+            - Speak louder and clearer
+            - Ensure stable internet
+            """)
+        
+        st.markdown("### 📊 Comprehensive Analytics")
+        fig = plot_advanced_metrics(metrics, get_session_history())
+        st.pyplot(fig)
+        
+        st.markdown("### 🤖 AI-Powered Insights")
+        st.markdown(f"""
+        <div class="ai-insight">
+        {metrics.get('ai_feedback', 'No AI feedback available')}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("🔄 Practice Again", use_container_width=True, type="primary"):
+                st.session_state.analysis_complete = False
+                st.session_state.session_data = None
+                st.rerun()
+        
+        with col2:
+            if st.button("📊 View Analytics", use_container_width=True):
+                st.session_state.analysis_complete = False
+                st.session_state.session_data = None
+                st.rerun()
+        
+        with col3:
+            report_data = f"""
+PRESENTATION ANALYSIS REPORT
+Generated: {metrics['date']}
+============================
+
+OVERALL SCORE: {metrics['overall_score']:.1f}/100
+
+KEY METRICS:
+- Words Per Minute: {metrics['wpm']:.0f}
+- Filler Words: {metrics['filler_count']}
+- Eye Contact: {metrics['eye_contact_score']:.0f}%
+- Confidence: {metrics.get('confidence_score', 0):.0f}%
+- Clarity: {metrics.get('clarity_score', 0):.0f}%
+- Engagement: {metrics.get('engagement_score', 0):.0f}%
+
+TRANSCRIPT:
+{metrics.get('transcript', 'No transcript available')}
+
+AI FEEDBACK:
+{metrics.get('ai_feedback', 'No AI feedback available')}
+"""
+            st.download_button(
+                "📥 Export Report",
+                report_data,
+                file_name=f"presentation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+
+# PAGE 2: SYSTEM CHECK
+elif "🧪 System Check" in page:
+    st.header("🔧 System Diagnostics")
+    
+    st.markdown("""
+    <div class="feedback-box">
+    <h3 style="color: #2c3e50 !important;">System Requirements Check</h3>
+    <p style="color: #2c3e50 !important;">Testing all components required for the AI Presentation Coach to function properly.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📹 Camera Test")
+        if st.button("Test Camera", use_container_width=True):
+            with st.spinner("Testing camera..."):
+                cap = cv2.VideoCapture(0)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret:
+                        frame = cv2.flip(frame, 1)
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        st.image(frame_rgb, caption="Camera Preview", use_container_width=True)
+                        st.success("✅ Camera is working properly!")
+                    else:
+                        st.error("❌ Camera detected but cannot capture frames")
+                    cap.release()
+                else:
+                    st.error("❌ No camera detected. Please connect a webcam.")
+    
+    with col2:
+        st.subheader("🎤 Microphone Test")
+        if st.button("Test Microphone", use_container_width=True):
+            with st.spinner("Testing microphone..."):
+                success, message, mic_list = test_microphone()
+                if success:
+                    st.success(f"✅ {message}")
+                    if mic_list:
+                        with st.expander("Available Microphones"):
+                            for i, mic in enumerate(mic_list):
+                                st.write(f"{i}. {mic}")
+                else:
+                    st.error(f"❌ {message}")
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("👁️ Face Detection Test")
+        if st.button("Test Face Detection", use_container_width=True):
+            with st.spinner("Testing face detection..."):
+                if st.session_state.face_cascade is not None:
+                    cap = cv2.VideoCapture(0)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret:
+                            frame = cv2.flip(frame, 1)
+                            eye_contact, face_detected, face_size = detect_face_and_eyes(frame)
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            st.image(frame_rgb, caption="Face Detection Preview", use_container_width=True)
+                            
+                            if face_detected:
+                                st.success("✅ Face detection working!")
+                                st.info(f"Eye Contact: {'✅ Detected' if eye_contact else '❌ Not Detected'}")
+                            else:
+                                st.warning("⚠️ No face detected. Ensure good lighting and face the camera.")
+                        cap.release()
+                    else:
+                        st.error("❌ Cannot access camera")
+                else:
+                    st.error("❌ Face detection models not loaded")
+    
+    with col2:
+        st.subheader("🗣️ Speech Recognition Test")
+        if st.button("Test Speech Recognition (5s)", use_container_width=True):
+            st.info("Speak clearly for 5 seconds...")
+            test_queue = queue.Queue()
+            test_thread = threading.Thread(target=record_audio_continuous, args=(5, test_queue, None))
+            test_thread.start()
+            
+            progress_bar = st.progress(0)
+            for i in range(50):
+                time.sleep(0.1)
+                progress_bar.progress((i + 1) / 50)
+            
+            test_thread.join()
+            
+            try:
+                result = test_queue.get_nowait()
+                if result and not result.startswith("ERROR"):
+                    st.success("✅ Speech recognition working!")
+                    st.write(f"**Transcribed:** {result}")
+                elif result.startswith("ERROR"):
+                    st.error(f"❌ {result}")
+                else:
+                    st.warning("⚠️ No speech detected. Speak louder or check microphone.")
+            except:
+                st.error("❌ Speech recognition failed")
+    
+    st.markdown("---")
+    
+    st.subheader("📦 Dependencies Check")
+    
+    dependencies = {
+        "OpenCV": cv2,
+        "NumPy": np,
+        "Pandas": pd,
+        "Matplotlib": plt,
+        "Seaborn": sns,
+        "Speech Recognition": sr,
+        "Requests": requests,
+        "PIL": Image
+    }
+    
+    dep_cols = st.columns(4)
+    for idx, (name, module) in enumerate(dependencies.items()):
+        with dep_cols[idx % 4]:
+            try:
+                version = getattr(module, '__version__', 'Unknown')
+                st.success(f"✅ {name}\n\nv{version}")
+            except:
+                st.success(f"✅ {name}\n\nInstalled")
+
+# PAGE 3: ANALYTICS DASHBOARD
+elif "📊 Analytics Dashboard" in page:
+    st.header("📊 Performance Analytics Dashboard")
+    
+    history_df = get_session_history()
+    
+    if len(history_df) == 0:
+        st.info("""
+        ### No Data Available Yet
+        
+        Complete your first practice session to see analytics here!
+        
+        Go to **🎤 Live Practice** to get started.
+        """)
+    else:
+        # Summary Statistics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h2 style="color: white; margin: 0;">{len(history_df)}</h2>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Total Sessions</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            avg_score = history_df['overall_score'].mean()
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h2 style="color: white; margin: 0;">{avg_score:.1f}</h2>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Average Score</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            best_score = history_df['overall_score'].max()
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h2 style="color: white; margin: 0;">{best_score:.1f}</h2>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Best Score</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            avg_wpm = history_df['wpm'].mean()
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); padding: 1.5rem; border-radius: 15px; color: white; text-align: center;">
+                <h2 style="color: white; margin: 0;">{avg_wpm:.0f}</h2>
+                <p style="margin: 0.5rem 0 0 0; color: white;">Avg WPM</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Progression Chart
+        st.subheader("📈 Score Progression")
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        recent = history_df.head(20).iloc[::-1]
+        sessions = range(1, len(recent) + 1)
+        
+        ax.plot(sessions, recent['overall_score'], marker='o', linewidth=3,
+                color='#667eea', markersize=10, label='Overall Score')
+        ax.plot(sessions, recent['eye_contact_score'], marker='s', linewidth=2,
+                color='#764ba2', markersize=8, alpha=0.7, label='Eye Contact')
+        ax.plot(sessions, recent['wpm'] * 0.5, marker='^', linewidth=2,
+                color='#f093fb', markersize=8, alpha=0.7, label='WPM (scaled)')
+        
+        ax.set_xlabel('Session Number', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Score', fontsize=14, fontweight='bold')
+        ax.set_title('Performance Over Time', fontsize=16, fontweight='bold')
+        ax.legend(loc='best', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0, 105)
+        
+        st.pyplot(fig)
+        
+        st.markdown("---")
+        
+        # Detailed Session Table
+        st.subheader("📋 Session History")
+        
+        display_df = history_df[['date', 'overall_score', 'wpm', 'filler_count', 'eye_contact_score', 'duration']].copy()
+        display_df['date'] = pd.to_datetime(display_df['date']).dt.strftime('%Y-%m-%d %H:%M')
+        display_df.columns = ['Date', 'Score', 'WPM', 'Fillers', 'Eye Contact %', 'Duration (s)']
+        display_df = display_df.round(1)
+        
+        st.dataframe(display_df, use_container_width=True, height=400)
+        
+        # Download option
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            "📥 Download Full History (CSV)",
+            csv,
+            "presentation_history.csv",
+            "text/csv",
+            use_container_width=True
+        )
+
+# PAGE 4: AI SETTINGS
+elif "⚙️ AI Settings" in page:
+    st.header("⚙️ AI Configuration")
+    
+    st.markdown("""
+    <div class="feedback-box">
+    <h3 style="color: #2c3e50 !important;">🤖 Google Gemini AI Integration</h3>
+    <p style="color: #2c3e50 !important;">
+    Enable advanced AI-powered feedback by connecting your Google Gemini API key. 
+    Without an API key, the system will use rule-based feedback (still effective).
+    </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.subheader("🔑 API Key Configuration")
     
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("📋 Instructions")
-        st.markdown("""
-        1. Select recording duration
-        2. Click **Start Live Recording**
-        3. Speak naturally while looking at camera
-        4. Analysis starts automatically when done
-        """)
-        
-        # Duration selection
-        duration_options = {
-            "30 seconds": 30,
-            "1 minute": 60,
-            "2 minutes": 120,
-            "3 minutes": 180,
-            "5 minutes": 300
-        }
-        
-        selected_duration = st.selectbox(
-            "Select Recording Duration:",
-            options=list(duration_options.keys()),
-            index=1
+        api_key = st.text_input(
+            "Enter your Gemini API Key:",
+            type="password",
+            value=st.session_state.gemini_api_key,
+            placeholder="AIzaSy..."
         )
         
-        duration = duration_options[selected_duration]
-        
-        # Microphone selection (optional)
-        try:
-            mic_list = sr.Microphone.list_microphone_names()
-            if len(mic_list) > 1:
-                mic_choice = st.selectbox(
-                    "Select Microphone (optional):",
-                    options=["Default"] + [f"{i}: {name}" for i, name in enumerate(mic_list)]
-                )
-                if mic_choice != "Default":
-                    selected_mic_index = int(mic_choice.split(":")[0])
-                else:
-                    selected_mic_index = None
-            else:
-                selected_mic_index = None
-        except:
-            selected_mic_index = None
-        
-        # Start recording button
-        if not st.session_state.recording:
-            if st.button("🔴 Start Live Recording", type="primary", use_container_width=True):
-                # Test microphone first
-                success, _, _ = test_microphone()
-                if not success:
-                    st.error("❌ Microphone not detected! Please check 'Microphone Test' page.")
-                else:
-                    st.session_state.recording = True
-                    st.session_state.recorded_text = ""
-                    st.session_state.video_frames = []
-                    st.session_state.emotion_data = []
-                    st.rerun()
-        
-        # Recording in progress
-        if st.session_state.recording:
-            st.warning(f"🔴 **RECORDING IN PROGRESS** - {selected_duration}")
-            st.info("💡 **Speak clearly and naturally. Look at the camera!**")
-            
-            # Placeholders
-            video_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            audio_status = st.empty()
-            
-            # Initialize camera
-            cap = cv2.VideoCapture(0)
-            
-            if not cap.isOpened():
-                st.error("❌ Could not access webcam. Please check your camera permissions.")
-                st.session_state.recording = False
-                st.stop()
-            
-            # Start audio recording in separate thread
-            audio_queue = queue.Queue()
-            audio_thread = threading.Thread(
-                target=record_audio_continuous, 
-                args=(duration, audio_queue, selected_mic_index if 'selected_mic_index' in locals() else None)
-            )
-            audio_thread.start()
-            audio_status.info("🎤 Audio recording started...")
-            
-            # Record video
-            start_time = time.time()
-            frame_count = 0
-            eye_contact_frames = 0
-            total_frames = 0
-            emotion_list = []
-            
-            while time.time() - start_time < duration:
-                ret, frame = cap.read()
-                
-                if not ret:
-                    break
-                
-                # Flip frame for mirror effect
-                frame = cv2.flip(frame, 1)
-                
-                # Analyze frame
-                eye_contact, face_detected = detect_face_and_eyes(frame)
-                emotion = simple_emotion_detection(frame)
-                
-                if face_detected:
-                    total_frames += 1
-                    if eye_contact:
-                        eye_contact_frames += 1
-                    emotion_list.append(emotion)
-                
-                # Draw info on frame
-                if face_detected:
-                    cv2.putText(frame, f"Face: {emotion.title()}", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    if eye_contact:
-                        cv2.putText(frame, "Good Eye Contact!", 
-                                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    cv2.putText(frame, "No Face Detected", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # Display frame
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-                
-                # Update progress
-                elapsed = time.time() - start_time
-                progress = min(elapsed / duration, 1.0)
-                progress_bar.progress(progress)
-                status_text.text(f"Recording: {int(elapsed)}s / {duration}s")
-                
-                frame_count += 1
-                time.sleep(0.03)  # ~30 FPS
-            
-            # Stop recording
-            cap.release()
-            st.session_state.recording = False
-            audio_status.info("⏳ Processing audio... Please wait...")
-            
-            # Wait for audio thread
-            audio_thread.join(timeout=10)
-            
-            # Get transcribed text
-            try:
-                transcribed_text = audio_queue.get_nowait()
-                if transcribed_text.startswith("ERROR:"):
-                    st.error(transcribed_text)
-                    transcribed_text = ""
-            except:
-                transcribed_text = ""
-            
-            # Calculate metrics
-            speech_metrics = analyze_speech_text(transcribed_text)
-            
-            # Calculate WPM
-            if duration > 0 and speech_metrics['word_count'] > 0:
-                wpm = (speech_metrics['word_count'] / duration) * 60
-            else:
-                wpm = 0
-            
-            # Calculate eye contact score
-            if total_frames > 0:
-                eye_contact_score = (eye_contact_frames / total_frames) * 100
-            else:
-                eye_contact_score = 0
-            
-            # Calculate emotion distribution
-            emotion_counter = Counter(emotion_list)
-            emotion_scores = dict(emotion_counter)
-            if emotion_scores:
-                dominant_emotion = max(emotion_scores, key=emotion_scores.get)
-            else:
-                dominant_emotion = 'neutral'
-            
-            # Compile metrics
-            metrics = {
-                'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'duration': duration,
-                'wpm': wpm,
-                'word_count': speech_metrics['word_count'],
-                'filler_count': speech_metrics['filler_count'],
-                'pause_count': speech_metrics['pause_count'],
-                'eye_contact_score': eye_contact_score,
-                'emotion_scores': emotion_scores,
-                'dominant_emotion': dominant_emotion,
-                'transcript': transcribed_text,
-                'overall_score': 0
-            }
-            
-            metrics['overall_score'] = calculate_overall_score(metrics)
-            
-            # Save to database
-            save_session(metrics)
-            
-            st.session_state.session_data = metrics
-            st.session_state.analysis_complete = True
-            
-            st.success("✅ Recording complete! Analyzing...")
-            time.sleep(1)
-            st.rerun()
+        if st.button("💾 Save API Key", use_container_width=True):
+            st.session_state.gemini_api_key = api_key
+            st.success("✅ API Key saved successfully!")
     
     with col2:
-        st.subheader("💡 Tips")
-        st.info("""
-        **For Best Results:**
-        - Good lighting on face
-        - Look at camera often
-        - Speak clearly & loudly
-        - Minimize background noise
-        - Check microphone first
-        """)
-        
-        st.subheader("🎯 Goals")
         st.markdown("""
-        - **WPM**: 120-180
-        - **Eye Contact**: >70%
-        - **Fillers**: <5
-        - **Expression**: Positive
-        """)
-        
-        # Microphone status
-        if st.button("🔍 Check Mic"):
-            success, msg, _ = test_microphone()
-            if success:
-                st.success("✅ Mic OK")
-            else:
-                st.error("❌ Mic Issue")
+        <div style="background: #f8f9fa; padding: 1rem; border-radius: 10px; border: 2px solid #667eea;">
+        <h4 style="color: #2c3e50 !important; margin-top: 0;">How to Get API Key:</h4>
+        <ol style="color: #2c3e50 !important; font-size: 0.9rem;">
+            <li>Visit <a href="https://makersuite.google.com/app/apikey" target="_blank">Google AI Studio</a></li>
+            <li>Click "Get API Key"</li>
+            <li>Create new key</li>
+            <li>Copy and paste here</li>
+        </ol>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Display results
-    if st.session_state.analysis_complete and st.session_state.session_data:
-        st.success("✅ Analysis Complete!")
-        
-        metrics = st.session_state.session_data
-        
-        # Overall score
-        st.markdown("---")
-        score_col1, score_col2, score_col3 = st.columns([1, 2, 1])
-        with score_col2:
-            score = metrics['overall_score']
-            if score >= 80:
-                color = "#2ecc71"
-                emoji = "🌟"
-                level = "Excellent"
-            elif score >= 60:
-                color = "#f39c12"
-                emoji = "👍"
-                level = "Good"
-            else:
-                color = "#e74c3c"
-                emoji = "📈"
-                level = "Needs Improvement"
-            
-            st.markdown(f"<h1 style='text-align: center; color: {color};'>{emoji} {score:.1f}/100</h1>", 
-                       unsafe_allow_html=True)
-            st.markdown(f"<h3 style='text-align: center;'>{level}</h3>", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Transcript
-        if metrics.get('transcript') and len(metrics['transcript']) > 0:
-            with st.expander("📝 View Transcript", expanded=True):
-                st.write(metrics['transcript'])
+    st.markdown("---")
+    
+    st.subheader("🧪 Test AI Connection")
+    
+    if st.button("Test Gemini API", use_container_width=True):
+        if not st.session_state.gemini_api_key:
+            st.warning("⚠️ No API key configured. Using rule-based feedback.")
         else:
-            st.warning("⚠️ **No speech detected!** Check:")
-            st.markdown("""
-            - Microphone is unmuted
-            - Microphone permissions granted
-            - Speaking loud enough
-            - Internet connection active
-            - Try 'Microphone Test' page
-            """)
-        
-        # Detailed metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            wpm_delta = "Optimal" if 120 <= metrics['wpm'] <= 180 else "Adjust"
-            st.metric("Words Per Minute", f"{metrics['wpm']:.0f}", delta=wpm_delta)
-        
-        with col2:
-            filler_delta = "Good" if metrics['filler_count'] < 5 else "Reduce"
-            st.metric("Filler Words", metrics['filler_count'], delta=filler_delta)
-        
-        with col3:
-            eye_delta = "Great" if metrics['eye_contact_score'] > 70 else "Improve"
-            st.metric("Eye Contact", f"{metrics['eye_contact_score']:.0f}%", delta=eye_delta)
-        
-        with col4:
-            st.metric("Dominant Emotion", metrics['dominant_emotion'].title())
-        
-        # Visualizations
-        st.subheader("📊 Detailed Analysis")
-        history_df = get_session_history()
-        fig = plot_metrics(metrics, history_df)
-        st.pyplot(fig)
-        
-        # Feedback
-        st.subheader("💬 Personalized Feedback")
-        feedback = generate_feedback(metrics)
-        for item in feedback:
-            st.markdown(item)
-        
-        # Improvement suggestions
-        st.subheader("🎯 Action Items for Next Session")
-        suggestions = []
-        if metrics['filler_count'] > 5:
-            suggestions.append("Practice pausing for 1-2 seconds instead of using filler words")
-        if metrics['eye_contact_score'] < 70:
-            suggestions.append("Place a mark near your camera and focus on it while speaking")
-        if metrics['wpm'] < 120:
-            suggestions.append("Read aloud daily to naturally increase your speaking pace")
-        if metrics['wpm'] > 180:
-            suggestions.append("Practice with a timer - aim for 150 words per minute")
-        if metrics['word_count'] < 30:
-            suggestions.append("Speak more during recording to get comprehensive feedback")
-        
-        if suggestions:
-            for i, suggestion in enumerate(suggestions, 1):
-                st.markdown(f"{i}. {suggestion}")
-        else:
-            st.success("Great job! Keep practicing to maintain your performance level.")
-        
-        # Reset button
-        if st.button("🔄 Start New Session", use_container_width=True):
-            st.session_state.analysis_complete = False
-            st.session_state.session_data = None
-            st.rerun()
-
-elif page == "History & Progress":
-    st.header("📈 Your Progress Journey")
+            with st.spinner("Testing API connection..."):
+                test_metrics = {
+                    'wpm': 150,
+                    'filler_count': 3,
+                    'eye_contact_score': 80,
+                    'duration': 60,
+                    'word_count': 150
+                }
+                
+                feedback = get_gemini_feedback("This is a test presentation about public speaking skills.", test_metrics)
+                
+                if "error" in feedback.lower() or len(feedback) < 50:
+                    st.error("❌ API test failed. Check your API key.")
+                else:
+                    st.success("✅ Gemini AI is connected and working!")
+                    with st.expander("View Sample AI Feedback"):
+                        st.markdown(f"""
+                        <div class="ai-insight">
+                        {feedback}
+                        </div>
+                        """, unsafe_allow_html=True)
     
-    history_df = get_session_history()
+    st.markdown("---")
     
-    if len(history_df) > 0:
-        st.subheader(f"Total Sessions: {len(history_df)}")
-        
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            avg_score = history_df['overall_score'].mean()
-            st.metric("Average Score", f"{avg_score:.1f}/100")
-        
-        with col2:
-            avg_wpm = history_df['wpm'].mean()
-            st.metric("Average WPM", f"{avg_wpm:.0f}")
-        
-        with col3:
-            avg_fillers = history_df['filler_count'].mean()
-            st.metric("Avg Filler Words", f"{avg_fillers:.1f}")
-        
-        with col4:
-            avg_eye = history_df['eye_contact_score'].mean()
-            st.metric("Avg Eye Contact", f"{avg_eye:.0f}%")
-        
-        # Progress charts
-        st.subheader("📊 Progress Over Time")
-        
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        
-        # Overall score trend
-        axes[0, 0].plot(range(len(history_df)), history_df['overall_score'][::-1], 
-                       marker='o', linewidth=2, color='#9b59b6', markersize=8)
-        axes[0, 0].set_xlabel('Session Number', fontsize=11)
-        axes[0, 0].set_ylabel('Overall Score', fontsize=11)
-        axes[0, 0].set_title('Overall Score Progression', fontsize=12, fontweight='bold')
-        axes[0, 0].grid(True, alpha=0.3)
-        axes[0, 0].set_ylim(0, 105)
-        
-        # WPM trend
-        axes[0, 1].plot(range(len(history_df)), history_df['wpm'][::-1], 
-                       marker='s', linewidth=2, color='#3498db', markersize=8)
-        axes[0, 1].axhline(y=120, color='g', linestyle='--', alpha=0.5, label='Min optimal')
-        axes[0, 1].axhline(y=180, color='r', linestyle='--', alpha=0.5, label='Max optimal')
-        axes[0, 1].set_xlabel('Session Number', fontsize=11)
-        axes[0, 1].set_ylabel('Words Per Minute', fontsize=11)
-        axes[0, 1].set_title('Speaking Pace Progression', fontsize=12, fontweight='bold')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Filler words trend
-        axes[1, 0].plot(range(len(history_df)), history_df['filler_count'][::-1], 
-                       marker='^', linewidth=2, color='#e74c3c', markersize=8)
-        axes[1, 0].set_xlabel('Session Number', fontsize=11)
-        axes[1, 0].set_ylabel('Filler Word Count', fontsize=11)
-        axes[1, 0].set_title('Filler Words Reduction', fontsize=12, fontweight='bold')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Eye contact trend
-        axes[1, 1].plot(range(len(history_df)), history_df['eye_contact_score'][::-1], 
-                       marker='D', linewidth=2, color='#2ecc71', markersize=8)
-        axes[1, 1].set_xlabel('Session Number', fontsize=11)
-        axes[1, 1].set_ylabel('Eye Contact Score (%)', fontsize=11)
-        axes[1, 1].set_title('Eye Contact Improvement', fontsize=12, fontweight='bold')
-        axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].set_ylim(0, 105)
-        
-        plt.tight_layout()
-        st.pyplot(fig)
-        
-        # Session history table
-        st.subheader("📋 Session History")
-        display_df = history_df[['date', 'overall_score', 'wpm', 'filler_count', 
-                                'eye_contact_score']].copy()
-        display_df.columns = ['Date', 'Overall Score', 'WPM', 'Filler Words', 'Eye Contact %']
-        display_df['Overall Score'] = display_df['Overall Score'].round(1)
-        display_df['WPM'] = display_df['WPM'].round(0)
-        display_df['Eye Contact %'] = display_df['Eye Contact %'].round(0)
-        st.dataframe(display_df, use_container_width=True)
-        
-        # Download data
-        csv = display_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download History as CSV",
-            data=csv,
-            file_name=f"presentation_history_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
-        
-    else:
-        st.info("No practice sessions yet. Start your first session to see your progress!")
-        st.markdown("### 🚀 Get Started")
-        st.markdown("Complete live recording sessions to track your improvement over time.")
+    st.subheader("⚙️ Advanced Settings")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        <div class="feedback-box">
+        <h4 style="color: #2c3e50 !important;">Feedback Mode</h4>
+        <p style="color: #2c3e50 !important;">
+        <strong>AI-Powered:</strong> Uses Gemini for personalized, context-aware feedback<br>
+        <strong>Rule-Based:</strong> Uses predefined rules and thresholds
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("""
+        <div class="feedback-box">
+        <h4 style="color: #2c3e50 !important;">Current Status</h4>
+        <p style="color: #2c3e50 !important;">
+        <strong>Mode:</strong> {}<br>
+        <strong>API Key:</strong> {}
+        </p>
+        </div>
+        """.format(
+            "AI-Powered ✅" if st.session_state.gemini_api_key else "Rule-Based 📏",
+            "Configured ✅" if st.session_state.gemini_api_key else "Not Set ❌"
+        ), unsafe_allow_html=True)
 
-else:  # About page
-    st.header("About AI Presentation Coach")
+# PAGE 5: ABOUT PROJECT
+elif "ℹ️ About Project" in page:
+    st.header("ℹ️ About This Project")
     
     st.markdown("""
-    ### 🎯 Project Overview
+    <div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; margin-bottom: 2rem;">
+        <h1 style="color: white; margin: 0;">🎯 AI Presentation Coach Pro</h1>
+        <p style="color: white; margin: 0.5rem 0 0 0; font-size: 1.2rem;">Advanced Multimodal Presentation Analysis System</p>
+        <p style="color: white; margin: 0.5rem 0 0 0; opacity: 0.9;">Version 3.0 - Professional Edition with AI Integration</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    The **Emotion-Aware AI Presentation Coach** is a multimodal feedback system designed to help 
-    students and professionals improve their public speaking confidence and presentation skills.
+    col1, col2 = st.columns(2)
     
-    ### ✨ Key Features
+    with col1:
+        st.markdown("""
+        <div class="feedback-box">
+        <h3 style="color: #2c3e50 !important;">🎓 Project Details</h3>
+        <ul style="color: #2c3e50 !important;">
+            <li><strong>Course:</strong> DES646 - Design Engineering and Analysis</li>
+            <li><strong>Institution:</strong> Your University Name</li>
+            <li><strong>Year:</strong> 2025</li>
+            <li><strong>Category:</strong> AI/ML, Computer Vision, NLP</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="feedback-box">
+        <h3 style="color: #2c3e50 !important;">👥 Team Members</h3>
+        <ul style="color: #2c3e50 !important;">
+            <li>Surya</li>
+            <li>Pushpendra</li>
+            <li>Meet</li>
+            <li>Vasundhara</li>
+            <li>Ayush</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
-    - **Live Video Recording**: Records from webcam with real-time face detection
-    - **Speech Recognition**: Converts speech to text using Google Speech API
-    - **Microphone Diagnostics**: Built-in testing to troubleshoot audio issues
-    - **Speech Analysis**: Detects pacing (WPM), filler words, and pauses
-    - **Emotion Recognition**: Analyzes facial expressions during presentations
-    - **Eye Contact Tracking**: Estimates gaze direction and engagement
-    - **Personalized Feedback**: Generates actionable improvement suggestions
-    - **Progress Tracking**: Monitors improvement across multiple sessions
-    - **Visual Dashboard**: Comprehensive analytics and trend visualization
+    with col2:
+        st.markdown("""
+        <div class="feedback-box">
+        <h3 style="color: #2c3e50 !important;">🔧 Technologies Used</h3>
+        <ul style="color: #2c3e50 !important;">
+            <li><strong>Frontend:</strong> Streamlit</li>
+            <li><strong>Computer Vision:</strong> OpenCV, Haar Cascades</li>
+            <li><strong>Speech Recognition:</strong> Google Speech API</li>
+            <li><strong>AI:</strong> Google Gemini Pro</li>
+            <li><strong>Data Analysis:</strong> Pandas, NumPy</li>
+            <li><strong>Visualization:</strong> Matplotlib, Seaborn</li>
+            <li><strong>Database:</strong> SQLite</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
-    ### 🛠️ Technology Stack
+    st.markdown("---")
     
-    - **Framework**: Streamlit
-    - **Computer Vision**: OpenCV with Haar Cascades
-    - **Speech Recognition**: SpeechRecognition (Google API)
-    - **Data Storage**: SQLite
-    - **Visualization**: Matplotlib, Pandas
+    st.subheader("✨ Key Features")
     
-    ### 👥 Development Team
+    features_col1, features_col2, features_col3 = st.columns(3)
     
-    - Surya Shukla (221109) - Point of Contact
-    - Pushpendra Singh (220841)
-    - Meet Pal Singh (220644)
-    - Vasundhara Agarwal (221177)
-    - Ayush (220259)
+    with features_col1:
+        st.markdown("""
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">🎥 Video Analysis</h4>
+        <ul style="color: #2c3e50 !important;">
+            <li>Real-time face detection</li>
+            <li>Eye contact tracking</li>
+            <li>Emotion recognition</li>
+            <li>Body language analysis</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
-    ### 📚 Research Direction
+    with features_col2:
+        st.markdown("""
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">🗣️ Audio Analysis</h4>
+        <ul style="color: #2c3e50 !important;">
+            <li>Speech-to-text transcription</li>
+            <li>Speaking pace (WPM)</li>
+            <li>Filler words detection</li>
+            <li>Pause pattern analysis</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
-    This project aims for publication at venues including:
-    - ACM IUI 2026 (Intelligent User Interfaces)
-    - India HCI 2026
-    - ACII (Affective Computing and Intelligent Interaction)
+    with features_col3:
+        st.markdown("""
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">🤖 AI Insights</h4>
+        <ul style="color: #2c3e50 !important;">
+            <li>Personalized feedback</li>
+            <li>Performance scoring</li>
+            <li>Progress tracking</li>
+            <li>Improvement suggestions</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
     
-    ### 🎓 Course Information
+    st.markdown("---")
     
-    **Course**: DES646 - Mid-Term Assessment Project  
-    **Project**: Emotion-Aware AI Presentation Coach
+    st.subheader("🎯 Project Objectives")
     
-    ---
+    st.markdown("""
+    <div class="feedback-box">
+    <ol style="color: #2c3e50 !important; line-height: 2;">
+        <li><strong>Develop a comprehensive multimodal analysis system</strong> combining computer vision and natural language processing</li>
+        <li><strong>Provide actionable feedback</strong> to help users improve their presentation skills</li>
+        <li><strong>Integrate AI capabilities</strong> for intelligent, context-aware analysis</li>
+        <li><strong>Create an intuitive interface</strong> that makes professional coaching accessible to everyone</li>
+        <li><strong>Track progress over time</strong> with detailed analytics and visualizations</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
     
-    ### 📖 How to Use
+    st.markdown("---")
     
-    1. **Test Microphone**: Visit 'Microphone Test' page to ensure audio is working
-    2. **Select Duration**: Choose recording length (30s to 5min)
-    3. **Start Recording**: Click the button and begin presenting
-    4. **Speak Naturally**: Look at camera and deliver your content clearly
-    5. **Get Feedback**: Receive detailed analysis with improvement tips
-    6. **Track Progress**: Review history to see your improvement
+    st.subheader("📚 Use Cases")
     
-    ### 💻 System Requirements
+    use_cases_col1, use_cases_col2 = st.columns(2)
     
-    - **Webcam**: Required for video recording
-    - **Microphone**: Required for speech recognition (with proper permissions)
-    - **Internet**: Required for Google Speech API
-    - **Python**: 3.8+ with required libraries
+    with use_cases_col1:
+        st.markdown("""
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">🎓 Education</h4>
+        <p style="color: #2c3e50 !important;">
+        Students preparing for presentations, thesis defenses, or public speaking assignments
+        </p>
+        </div>
+        
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">💼 Professional</h4>
+        <p style="color: #2c3e50 !important;">
+        Business professionals practicing for pitches, meetings, or conference talks
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    ### 📦 Installation
+    with use_cases_col2:
+        st.markdown("""
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">🎤 Public Speaking</h4>
+        <p style="color: #2c3e50 !important;">
+        Aspiring speakers building confidence and refining their delivery style
+        </p>
+        </div>
+        
+        <div class="ai-insight">
+        <h4 style="color: #2c3e50 !important;">👨‍🏫 Training</h4>
+        <p style="color: #2c3e50 !important;">
+        Trainers and coaches monitoring student progress and providing feedback
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    ```bash
-    pip install streamlit opencv-python speechrecognition pyaudio pandas matplotlib
-    ```
+    st.markdown("---")
     
-    ### 🚀 Running the Application
-    
-    ```bash
-    streamlit run app.py
-    ```
-    
-    ### 🔧 Troubleshooting Microphone Issues
-    
-    **Windows:**
-    - Settings > Privacy > Microphone > Allow apps to access microphone
-    - Enable for Python/Terminal
-    
-    **Mac:**
-    - System Preferences > Security & Privacy > Microphone
-    - Enable Terminal/VS Code/iTerm
-    
-    **Linux:**
-    ```bash
-    # Check microphone
-    arecord -l
-    # Test recording
-    arecord -d 5 test.wav && aplay test.wav
-    ```
-    
-    **Common Fixes:**
-    - Unmute microphone in system settings
-    - Close other apps using microphone (Zoom, Skype, Discord)
-    - Select correct microphone in app settings
-    - Grant permissions to Terminal/Python
-    - Restart Terminal/VS Code after granting permissions
-    
-    ### 🔮 Future Enhancements
-    
-    - Advanced emotion recognition with DeepFace/FER
-    - MediaPipe face mesh for precise eye tracking
-    - Gesture analysis and body language feedback
-    - Offline speech recognition with Whisper
-    - Multi-language support
-    - Export reports as PDF
-    - Comparison with expert presentations
-    
-    ### 📊 Metrics Explained
-    
-    **Overall Score (0-100):**
-    - Combines all metrics into single performance indicator
-    - 80+ = Excellent, 60-79 = Good, <60 = Needs Improvement
-    
-    **Words Per Minute (WPM):**
-    - Optimal range: 120-180 WPM
-    - Below 120: Too slow, may lose audience
-    - Above 180: Too fast, may reduce clarity
-    
-    **Filler Words:**
-    - Counts: um, uh, like, so, actually, basically, literally
-    - Target: Less than 5 per session
-    
-    **Eye Contact Score:**
-    - Percentage of time face and eyes detected
-    - Target: 70%+ for good engagement
-    
-    **Emotions:**
-    - Tracks: Happy, Confident, Neutral
-    - Shows engagement and confidence level
-    
-    ### 📞 Contact & Support
-    
-    For questions, feedback, or technical support:
-    - Contact: Development Team
-    - Course: DES646
-    
-    ### 📄 License
-    
-    This project is created for academic purposes as part of DES646 coursework.
-    
-    ---
-    
-    **Version 2.1 - Enhanced Microphone Detection & Diagnostics**
-    
-    *Built with ❤️ for better public speaking*
-    """)
+    st.markdown("""
+    <div style="text-align: center; padding: 1.5rem; background: #f8f9fa; border-radius: 15px;">
+        <p style="margin: 0; color: #2c3e50; font-size: 1.1rem;">
+        Built with ❤️ for Better Public Speaking | © 2025 DES646 Team
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Footer
 st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray;'>DES646 Project - AI Presentation Coach © 2025 | Live Recording with Audio Diagnostics</div>",
-    unsafe_allow_html=True
-)
+st.markdown("""
+<div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 15px; color: white; margin-top: 2rem;">
+    <h3 style="color: white; margin: 0;">🎯 AI Presentation Coach Pro</h3>
+    <p style="margin: 0.5rem 0; opacity: 0.9; color: white;">Advanced Multimodal Presentation Analysis System</p>
+    <p style="margin: 0; font-size: 0.9rem; opacity: 0.8; color: white;">DES646 Course Project © 2025 | Built with ❤️ for Better Public Speaking</p>
+    <p style="margin: 0.5rem 0 0 0; font-size: 0.8rem; opacity: 0.7; color: white;">Version 3.0 - Professional Edition with AI Integration</p>
+</div>
+""", unsafe_allow_html=True)
